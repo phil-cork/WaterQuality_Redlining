@@ -1,0 +1,257 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+# import packages
+knitr::opts_chunk$set(echo = TRUE)
+require(tidyverse)
+require(vroom)
+require(knitr)
+require(sf)
+library(leaflet)
+library(scales)
+```
+
+### SDWIS Health Violations Data Prep
+
+```{r}
+# transformation of raw SDWIS health violations data into filtered dataframe.
+# commented out and imported as dataframe to save time for testing purposes.
+
+#violators <- vroom("../data/SDWA_VIOLATIONS_ENFORCEMENT.csv", # read data
+#                    col_types = cols(.default = "c")) %>%
+#  filter(IS_HEALTH_BASED_IND == "Y") %>% # select only health-based violations
+#  mutate( #format dates as dates
+#    start = as.Date(COMPL_PER_BEGIN_DATE, 
+#                                   format = "%m/%d/%Y"),
+#    end = pmin(as.Date(CALCULATED_RTC_DATE,
+#                                 format = "%m/%d/%Y"))) %>% # set end date to most current report date
+#  filter(end >= "2017-01-01") # We load the violations table and filter to violations that end later than April 13, #2020, two years before the the most current data was released.
+#
+#write.csv(violators, "data/output/violators_2017.csv", row.names=FALSE)
+
+```
+
+```{r}
+violators <- read.csv("data/output/violators_2017.csv")
+# transform to Date format
+violators$start <- as.Date(violators$start)
+violators$end <- as.Date(violators$end)
+
+# create new column for length of duration
+violators <- violators %>%
+  select(PWSID, VIOLATION_ID, start, end) %>%
+  mutate(
+    violation_duration = end - start, violation=1) %>%
+  # create new column for if longer than 30 consecutive days
+  mutate(violation_30 = case_when(
+    violation_duration > 30 ~ 1,
+    TRUE~0
+  ))
+# drop duplicates
+violators <- unique(violators)
+```
+
+```{r}
+# import simple list of water systems and what state they serve
+states <- read.csv("data/output/pws_by_state.csv")
+# subset to tier 1 data states
+tier1_states <- c("TX", "PA", "CT", "AZ", "CA", "KS", "NJ", "NM", "OK", "UT", "WA")
+```
+
+```{r}
+# merge together and keep all columns creating the top-level SDWIS data
+states_vio <- merge(violators, states, all=TRUE, by.x="PWSID", by.y="pwsid") %>%
+  # keep only states in tier 1
+  filter(state_code %in% tier1_states) %>%
+  # all systems that were in states but not violators would have na for violation and violation_30, set to 0
+  replace_na(list(violation=0, violation_30=0))
+```
+
+
+## Viz 1 Data Prep
+
+```{r}
+
+states_vio_pct <- states_vio %>%
+  # keep all systems, their state, and whether they report a violation
+  select(PWSID, state_code, violation) %>%
+  # of this subset, drop duplicates
+  distinct() %>%
+  # group by state
+  group_by(state_code) %>%
+  # track how many systems report violations and the total number for each state
+  summarize(count=n(), violations=sum(violation)) %>%
+  # create new percentage column for how many systems report violations
+  mutate(pct_violations = round(violations/count,2)*100, no_violations=count-violations)
+
+```
+
+```{r}
+
+states_vio_pws <- states_vio %>%
+  # for other variables that will appear on data viz, select required columns
+  select(PWSID, VIOLATION_ID, violation_duration, violation, violation_30, state_code) %>%
+  # keep only violation reporting systems, group by state
+  filter(violation==1) %>%
+  group_by(state_code) %>%
+  # store total persistent violations, longest violation duration, total number of violation days, and total violations
+  summarize(total_violation30 = sum(violation_30), longest_violation=max(violation_duration),
+            violation_days=sum(violation_duration), total_violations=n())
+
+```
+
+```{r}
+# combine above transformations
+states_vio_m <- merge(states_vio_pws, states_vio_pct)
+# create binary indicator for highlighting in the app
+states_vio_m$texas <- ifelse(states_vio_m$state_code=="TX", 1, 0)
+# write.csv(states_vio_m, "../data/states_df.csv", row.names = FALSE)
+```
+
+### Plotting Examples for Data Viz 1
+
+```{r}
+# sample of using dynamic variables to create the same ggplot in the app
+x_var <- "pct_violations"
+y_var <- "state_code"
+
+ggplot(states_vio_pct, aes(x=.data[[x_var]], y=reorder(.data[[y_var]], .data[[x_var]]))) + 
+  geom_bar(stat="identity") +
+  theme_minimal()
+```
+
+## Viz 2 Data Prep
+
+```{r}
+
+# subset to only system and whether it reported persistent violations
+vios30_binary <- states_vio %>%
+  select(PWSID, violation_30) %>%
+  distinct()
+
+names(vios30_binary) <- c("pwsid", "violation_30")
+```
+
+```{r}
+# import dataset of merged redlined neighborhoods and water systems
+red_sab <- read.csv("data/output/red_sab.csv")
+```
+
+
+```{r}
+# format titles for easier reading
+red_sab$pws_name <- str_to_title(red_sab$pws_name, locale = "en")
+red_sab$pws_name <- str_replace(red_sab$pws_name, " Of ", " of ")
+
+```
+
+
+```{r}
+red_sab_ratios <- red_sab %>%
+  # group by each system and each level of grade it intersects with
+  group_by(pwsid, pws_name, state_code, holc_grade) %>%
+  # sum up the total area of geographies that intersect between redline and sab data for each systems
+  summarize(total_intersections = sum(intersection_size)) %>%
+  # for each system, calculate how much of the area that overlaps with any HOLC geography, how much is a given grade
+  mutate(intersection_ratio = total_intersections / sum(total_intersections)) %>%
+  mutate(intersection_percent = round(intersection_ratio*100,0))
+```
+
+```{r} 
+# merge with violations data, fill NAs and create new descriptive column
+red_sab_ratios <- merge(red_sab_ratios, vios30_binary, all.x=TRUE)
+red_sab_ratios[is.na(red_sab_ratios)] <- 0
+red_sab_ratios$violation30 <- ifelse(red_sab_ratios$violation_30==1, "Violations", "No Violations")
+```
+
+```{r}
+
+# filter to only redline to calculate redline/total for sorting/ordering purposes
+redline <- red_sab_ratios %>%
+  filter(holc_grade=="D") %>%
+  group_by(pws_name, state_code) %>%
+  summarize(red_percent = max(intersection_percent))
+
+# merge and fill NAs
+red_sab_ratios <- merge(red_sab_ratios, redline, all.x=TRUE)
+red_sab_ratios[is.na(red_sab_ratios)] <- 0
+
+# store for use in app
+# write.csv(red_sab_ratios, "../data/red_sab_ratios.csv", row.names=FALSE)
+```
+
+### Plotting Example for Data Viz 2
+
+```{r}
+# subset to state with string variable
+state <- "TX"
+
+# test dynamically changing text
+red_text <- subset(red_sab_ratios, state_code==state) %>%
+  select(pws_name, violation_30, red_percent) %>%
+  distinct() %>%
+  arrange(red_percent)
+
+con <- ifelse(red_text$violation_30 == 1, 'red', 'black')
+# subset to state string
+# create bar plot of how much each water system overlaps with each HOLC grade, ordered by the percent that overlaps with redlined areas
+ggplot(subset(red_sab_ratios, state_code==state), aes(y=reorder(pws_name, red_percent), x=intersection_percent, fill=holc_grade)) + 
+  geom_bar(position='fill', stat='identity') + 
+  labs(title="", subtitle="",
+       x="Percent Overlap with Redlining Districts", y="") + 
+  scale_fill_manual(values=c("springgreen2", "steelblue3", "gold", "firebrick2"), name="HOLC Grade") + 
+  # create manual white lines for easier interpretation
+  scale_x_continuous(breaks = seq(0, 1, by = .25), label=label_number(scale=100, suffix="%")) + 
+  geom_vline(xintercept = .25, color='white') + 
+  geom_vline(xintercept = .5, color='white') + 
+  geom_vline(xintercept = .75, color='white') + 
+  theme_minimal() + 
+  theme(panel.grid.major.y = element_blank(), panel.grid.minor=element_blank(),
+        axis.text.y = element_text(colour = con))
+```
+
+## Interactive Map Test
+
+```{r}
+# import and format
+red <- st_read("../data/shapefiles/redline_tx.shp")
+sab <- st_read("../data/shapefiles/overlap_sab.shp")
+
+sab$pws_name <- str_to_title(sab$pws_name, locale = "en")
+sab$pws_name <- str_replace(sab$pws_name, " Of ", " of ")
+
+```
+
+
+```{r}
+
+# create custom color scheme to match redline grades
+factpal <- colorFactor(c("springgreen2", "steelblue3", "gold", "firebrick2"), red$holc_grade)
+
+# create leaflet object
+leaflet_sab <- leaflet() %>% 
+  
+   addProviderTiles(providers$CartoDB.Positron) %>%
+  
+   addPolygons(data=sab,
+      # add the default service area bound polygons
+      weight = 1, fillOpacity = 0.5, fillColor='lightblue', color='blue',
+  # create popup that shows SAB name with population and connection details
+      popup = ~paste(pws_name, "</br>", "Population Served: ", comma(population), "</br>", "Connections: ", comma(service_co))) %>% 
+  
+  addPolygons(data=red,
+    weight=1, fillOpacity = 0.75, color='darkgrey',
+    fillColor=~factpal(holc_grade),
+    popup = ~paste(city, "</br>", "HOLC Grade: ", holc_grade)) %>%
+  
+  # set the default view
+  # 29.424349, -98.491142
+   setView(lng = -98.491142, lat = 29.42349, zoom = 10)
+
+leaflet_sab
+```
+
+
